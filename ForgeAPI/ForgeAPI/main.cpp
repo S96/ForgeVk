@@ -9,12 +9,15 @@
 
 #define GLM_FORCE_RADIANS
 #define GLM_FORCE_DEPTH_ZERO_TO_ONE
+#define GLM_ENABLE_EXPERIMENTAL
+#include <glm/gtx/hash.hpp>
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 
 #include <chrono>
 #include <fstream>
 #include <algorithm>
+#include <unordered_map>
 #include <vector>
 #include <array>
 #include <set>
@@ -87,7 +90,23 @@ struct Vertex
 
 		return attribute_descriptions;
 	}
+
+	bool operator ==(const Vertex& other) const
+	{
+		return pos == other.pos && color == other.color && uv == other.uv;
+	}
 };
+
+namespace std
+{
+	template<> struct hash<Vertex>
+	{
+		size_t operator()(Vertex const& vertex) const
+		{
+			return ((hash<glm::vec3>()(vertex.pos) ^ (hash<glm::vec3>()(vertex.color) << 1)) >> 1) ^ (hash<glm::vec2>()(vertex.uv) << 1);
+		}
+	};
+}
 
 struct UniformBufferObject
 {
@@ -228,11 +247,13 @@ private:
 
 	static void OnWindowResize(GLFWwindow* window, int width, int height)
 	{
-		if (width != 0 && height != 0)
+		if (width == 0 || height == 0)
 		{
-			HelloTriangleApplication* application = reinterpret_cast<HelloTriangleApplication*>(glfwGetWindowUserPointer(window));
-			application->RecreateSwapChain();
+			return;
 		}
+
+		HelloTriangleApplication* application = reinterpret_cast<HelloTriangleApplication*>(glfwGetWindowUserPointer(window));
+		application->RecreateSwapChain();
 	}
 
 	void CreateVkInstance()
@@ -401,6 +422,7 @@ private:
 		CreateImageViews();
 		CreateRenderPass();
 		CreateGraphicsPipeline();
+		CreateDepthResources();
 		CreateFrameBuffers();
 		CreateCommandBuffers();
 	}
@@ -433,7 +455,6 @@ private:
 		create_info.imageColorSpace = surface_format.colorSpace;
 		create_info.imageExtent = extent;
 		create_info.imageArrayLayers = 1;
-		// bit field for flags indicating usage - includes depth buffer etc - target for future custom options
 		create_info.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
 
 		// multiple queues need access, use concurrent mode
@@ -483,7 +504,7 @@ private:
 	{
 		VkAttachmentDescription depth_attachment = {};
 		depth_attachment.format = FindDepthFormat();
-		depth_attachment.samples = VK_SAMPLE_COUNT_1_BIT;
+		depth_attachment.samples = _vk_sample_count_flag_bits;
 		depth_attachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
 		depth_attachment.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
 		depth_attachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
@@ -498,7 +519,7 @@ private:
 		// render pass attachment
 		VkAttachmentDescription color_attachment = {};
 		color_attachment.format = _vk_swapchain_format;
-		color_attachment.samples = VK_SAMPLE_COUNT_1_BIT;
+		color_attachment.samples = _vk_sample_count_flag_bits;
 		color_attachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
 		color_attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
 		color_attachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
@@ -506,17 +527,23 @@ private:
 		color_attachment.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 		color_attachment.finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
 
-		// subpasses
 		VkAttachmentReference attachment_reference = {};
 		attachment_reference.attachment = 0;
 		attachment_reference.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+
+		VkAttachmentDescription multisample_attachment = {};
+		multisample_attachment.format = _vk_swapchain_format;
+		multisample_attachment.samples = _vk_sample_count_flag_bits;
+		multisample_attachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+		multisample_attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
 
 		VkSubpassDescription subpass = {};
 		subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
 		subpass.colorAttachmentCount = 1;
 		subpass.pColorAttachments = &attachment_reference;
+		subpass.pResolveAttachments = ;
 		subpass.pDepthStencilAttachment = &depth_attachment_reference;
-
+		
 		VkSubpassDependency subpass_dependency = {};
 		subpass_dependency.srcSubpass = VK_SUBPASS_EXTERNAL;
 		subpass_dependency.dstSubpass = 0;
@@ -644,14 +671,15 @@ private:
 		rasterizer_create_info.polygonMode = VK_POLYGON_MODE_FILL;
 		rasterizer_create_info.lineWidth = 1.0f;
 		rasterizer_create_info.cullMode = VK_CULL_MODE_BACK_BIT;
-		rasterizer_create_info.frontFace = VK_FRONT_FACE_CLOCKWISE;
+		rasterizer_create_info.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
 		rasterizer_create_info.depthBiasEnable = VK_FALSE;
 
 		// multisampling
 		VkPipelineMultisampleStateCreateInfo multisampling = {};
 		multisampling.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
-		multisampling.sampleShadingEnable = VK_FALSE;
-		multisampling.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+		multisampling.sampleShadingEnable = VK_TRUE;
+		multisampling.rasterizationSamples = _vk_sample_count_flag_bits;
+		multisampling.minSampleShading = 0.25f;
 		
 		// depth stencil test
 		
@@ -735,7 +763,7 @@ private:
 	void CreateDepthResources()
 	{
 		VkFormat depth_format = FindDepthFormat();
-		CreateImage(_vk_swapchain_extent.width, _vk_swapchain_extent.height, depth_format, VK_IMAGE_TILING_OPTIMAL, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, _vk_depth_image, _vk_depth_image_memory);
+		CreateImage(_vk_swapchain_extent.width, _vk_swapchain_extent.height, depth_format, VK_IMAGE_TILING_OPTIMAL, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, VK_SAMPLE_COUNT_1_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, _vk_depth_image, _vk_depth_image_memory);
 		_vk_depth_image_view = CreateImageView(_vk_depth_image, depth_format, VK_IMAGE_ASPECT_DEPTH_BIT);
 		TransitionImageLayout(_vk_depth_image, depth_format, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
 	}
@@ -758,6 +786,7 @@ private:
 			create_info.width = _vk_swapchain_extent.width;
 			create_info.height = _vk_swapchain_extent.height;
 			create_info.layers = 1;
+
 
 			if (vkCreateFramebuffer(_vk_logical_device, &create_info, nullptr, &_vk_swapchain_frame_buffers[i]) != VK_SUCCESS)
 			{
@@ -803,7 +832,7 @@ private:
 
 		stbi_image_free(pixels);
 
-		CreateImage(texture_width, texture_height, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_TILING_OPTIMAL, VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, _vk_texture_image, _vk_texture_image_memory);
+		CreateImage(texture_width, texture_height, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_TILING_OPTIMAL, VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, VK_SAMPLE_COUNT_1_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, _vk_texture_image, _vk_texture_image_memory);
 
 		TransitionImageLayout(_vk_texture_image, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
 
@@ -986,7 +1015,7 @@ private:
 		render_pass_begin_info.renderPass = _vk_render_pass;
 		render_pass_begin_info.renderArea.offset = { 0,0 };
 		render_pass_begin_info.renderArea.extent = _vk_swapchain_extent;
-
+		
 		std::array<VkClearValue, 2> clear_values = {};
 		clear_values[0].color = { 0.0f, 0.0f, 0.0f, 1.0f };
 		clear_values[1].depthStencil = { 1.0f, 0 };
@@ -1007,6 +1036,11 @@ private:
 			vkCmdBindIndexBuffer(_vk_command_buffers[i], _vk_index_buffer, 0, VK_INDEX_TYPE_UINT32);
 			vkCmdBindDescriptorSets(_vk_command_buffers[i], VK_PIPELINE_BIND_POINT_GRAPHICS, _vk_pipeline_layout, 0, 1, &_vk_descriptor_set, 0, nullptr);
 			vkCmdDrawIndexed(_vk_command_buffers[i], static_cast<uint32_t>(_indices.size()), 1, 0, 0, 0);
+
+
+			// resolve multisampling????
+
+
 			vkCmdEndRenderPass(_vk_command_buffers[i]);
 			if (vkEndCommandBuffer(_vk_command_buffers[i]) != VK_SUCCESS)
 			{
@@ -1034,9 +1068,9 @@ private:
 		float time = std::chrono::duration<float, std::chrono::seconds::period>(current_time - start_time).count();
 
 		UniformBufferObject ubo = {};
-		ubo.model = glm::rotate(glm::mat4(1.0f), time * glm::radians(90.0f), glm::vec3(0.0f, 0.0f, 1.0f));
-		ubo.view = glm::lookAt(glm::vec3(2.0f, 2.0f, 2.0f), glm::vec3(0.0f, 0.0f, 0.0f), glm::vec3(0.0f, 0.0f, 1.0f));
-		ubo.proj = glm::perspective(glm::radians(45.0f), _vk_swapchain_extent.width / static_cast<float>(_vk_swapchain_extent.height), 0.1f, 10.0f);
+		ubo.model = glm::rotate(glm::mat4(1.0f), time * glm::radians(20.0f), glm::vec3(0.0f, 1.0f, 0.0f));
+		ubo.view = glm::lookAt(glm::vec3(0.0f, 7.0f, 15.0f), glm::vec3(0.0f, 0.0f, 0.0f), glm::vec3(0.0f, 1.0f, 0.0f));
+		ubo.proj = glm::perspective(glm::radians(45.0f), _vk_swapchain_extent.width / static_cast<float>(_vk_swapchain_extent.height), 0.1f, 100.0f);
 		ubo.proj[1][1] *= -1;
 
 		void* data;
@@ -1397,7 +1431,7 @@ private:
 		EndSingleTimeCommands(command_buffer);
 	}
 
-	void CreateImage(uint32_t width, uint32_t height, VkFormat format, VkImageTiling tiling, VkImageUsageFlags usage, VkMemoryPropertyFlags mem_properties, VkImage& image, VkDeviceMemory& image_memory)
+	void CreateImage(uint32_t width, uint32_t height, VkFormat format, VkImageTiling tiling, VkImageUsageFlags usage, VkSampleCountFlagBits samples, VkMemoryPropertyFlags mem_properties, VkImage& image, VkDeviceMemory& image_memory)
 	{
 		VkImageCreateInfo create_info = {};
 		create_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
@@ -1411,7 +1445,7 @@ private:
 		create_info.tiling = tiling;
 		create_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 		create_info.usage = usage;
-		create_info.samples = VK_SAMPLE_COUNT_1_BIT;
+		create_info.samples = samples;
 		create_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
 
 		if (vkCreateImage(_vk_logical_device, &create_info, nullptr, &image) != VK_SUCCESS)
@@ -1673,7 +1707,48 @@ private:
 
 	void LoadModel()
 	{
+		tinyobj::attrib_t attribute;
+		std::vector<tinyobj::shape_t> shapes;
+		std::vector<tinyobj::material_t> materials;
+		std::string error;
 
+		if (!tinyobj::LoadObj(&attribute, &shapes, &materials, &error, "Models/type-99.obj"))
+		{
+			throw std::runtime_error(error);
+		}
+
+		std::unordered_map<Vertex, uint32_t> unique_vertices = {};
+
+		for (const auto& shape : shapes)
+		{
+			for (const auto& index : shape.mesh.indices)
+			{
+				Vertex vert = {};
+
+				vert.pos =
+				{
+					attribute.vertices[3 * index.vertex_index + 0],
+					attribute.vertices[3 * index.vertex_index + 1],
+					attribute.vertices[3 * index.vertex_index + 2]
+				};
+
+				vert.uv =
+				{
+					attribute.texcoords[2 * index.texcoord_index + 0],
+					1 - attribute.texcoords[2 * index.texcoord_index + 1]
+				};
+
+				vert.color = { 1.0f, 1.0f, 1.0f };
+
+				if (unique_vertices.count(vert) == 0)
+				{
+					unique_vertices[vert] = static_cast<uint32_t>(_vertices.size());
+					_vertices.push_back(vert);
+				}
+
+				_indices.push_back(unique_vertices[vert]);
+			}
+		}
 	}
 
 	static std::vector<char> ReadFile(const std::string & filename)
@@ -1729,6 +1804,8 @@ private:
 	QueueFamilies _available_queue_families;
 	VkQueue _vk_graphics_queue; ///< Queue of vk graphics - IMPLICITLY DESTROYED WITH DEVICE
 	VkQueue _vk_present_queue;
+
+	VkSampleCountFlagBits _vk_sample_count_flag_bits = VK_SAMPLE_COUNT_4_BIT;
 
 	VkRenderPass _vk_render_pass;
 
